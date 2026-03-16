@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import json
 import logging
 import os
 import socket as _socket
@@ -492,6 +493,8 @@ class Stats:
 
 
 _stats = Stats()
+_active_connections: Set[str] = set()
+_start_time = time.monotonic()
 
 
 class _WsPool:
@@ -768,6 +771,7 @@ async def _handle_client(reader, writer):
     _stats.connections_total += 1
     peer = writer.get_extra_info('peername')
     label = f"{peer[0]}:{peer[1]}" if peer else "?"
+    _active_connections.add(label)
 
     _set_sock_opts(writer.transport)
 
@@ -1014,6 +1018,158 @@ async def _handle_client(reader, writer):
     except Exception as exc:
         log.error("[%s] unexpected: %s", label, exc)
     finally:
+        _active_connections.discard(label)
+        try:
+            writer.close()
+        except BaseException:
+            pass
+
+
+_MONITOR_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TG WS Proxy Monitor</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+         background: #0f1923; color: #e0e0e0; padding: 20px; }
+  h1 { color: #4fc3f7; margin-bottom: 20px; font-size: 1.5em; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 24px; }
+  .card { background: #1a2733; border-radius: 12px; padding: 20px; border: 1px solid #263545; }
+  .card .label { font-size: 0.8em; color: #78909c; text-transform: uppercase; letter-spacing: 1px; }
+  .card .value { font-size: 2em; font-weight: 700; color: #fff; margin-top: 4px; }
+  .card .value.green { color: #66bb6a; }
+  .card .value.blue { color: #42a5f5; }
+  .card .value.orange { color: #ffa726; }
+  .card .value.red { color: #ef5350; }
+  .section { background: #1a2733; border-radius: 12px; padding: 20px; border: 1px solid #263545; margin-bottom: 16px; }
+  .section h2 { font-size: 1.1em; color: #4fc3f7; margin-bottom: 12px; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #263545; font-size: 0.9em; }
+  th { color: #78909c; font-weight: 600; }
+  .clients-list { max-height: 300px; overflow-y: auto; }
+  .clients-list .item { padding: 6px 0; border-bottom: 1px solid #263545; font-family: monospace; font-size: 0.9em; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 0.75em; font-weight: 600; }
+  .badge.ws { background: #1b5e20; color: #66bb6a; }
+  .badge.tcp { background: #e65100; color: #ffa726; }
+  .badge.pass { background: #0d47a1; color: #42a5f5; }
+  .footer { text-align: center; color: #546e7a; font-size: 0.8em; margin-top: 20px; }
+  #status { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: #66bb6a; margin-right: 8px; }
+</style>
+</head>
+<body>
+<h1><span id="status"></span>Telegram WS Proxy Monitor</h1>
+<div class="grid">
+  <div class="card"><div class="label">Active Clients</div><div class="value green" id="active">-</div></div>
+  <div class="card"><div class="label">Total Connections</div><div class="value blue" id="total">-</div></div>
+  <div class="card"><div class="label">WebSocket</div><div class="value blue" id="ws">-</div></div>
+  <div class="card"><div class="label">TCP Fallback</div><div class="value orange" id="tcp_fb">-</div></div>
+  <div class="card"><div class="label">Passthrough</div><div class="value" id="pass">-</div></div>
+  <div class="card"><div class="label">HTTP Rejected</div><div class="value red" id="http_rej">-</div></div>
+  <div class="card"><div class="label">WS Errors</div><div class="value red" id="ws_err">-</div></div>
+  <div class="card"><div class="label">Pool Hit Rate</div><div class="value green" id="pool">-</div></div>
+</div>
+<div class="grid">
+  <div class="card"><div class="label">Upload</div><div class="value" id="up">-</div></div>
+  <div class="card"><div class="label">Download</div><div class="value" id="down">-</div></div>
+  <div class="card"><div class="label">Uptime</div><div class="value" id="uptime">-</div></div>
+</div>
+<div class="section">
+  <h2>Active Clients</h2>
+  <div class="clients-list" id="clients"><em>No active clients</em></div>
+</div>
+<div class="section">
+  <h2>WS Blacklist</h2>
+  <div id="blacklist"><em>None</em></div>
+</div>
+<div class="footer">Auto-refresh every 2s</div>
+<script>
+function fmt(s){if(s<60)return Math.floor(s)+'s';if(s<3600)return Math.floor(s/60)+'m '+Math.floor(s%60)+'s';var h=Math.floor(s/3600);return h+'h '+Math.floor((s%3600)/60)+'m';}
+async function refresh(){
+  try{
+    var r=await fetch('/api/stats');
+    var d=await r.json();
+    document.getElementById('active').textContent=d.active_connections;
+    document.getElementById('total').textContent=d.connections_total;
+    document.getElementById('ws').textContent=d.connections_ws;
+    document.getElementById('tcp_fb').textContent=d.connections_tcp_fallback;
+    document.getElementById('pass').textContent=d.connections_passthrough;
+    document.getElementById('http_rej').textContent=d.connections_http_rejected;
+    document.getElementById('ws_err').textContent=d.ws_errors;
+    var pt=d.pool_hits+d.pool_misses;
+    document.getElementById('pool').textContent=pt?Math.round(d.pool_hits/pt*100)+'%':'N/A';
+    document.getElementById('up').textContent=d.bytes_up_human;
+    document.getElementById('down').textContent=d.bytes_down_human;
+    document.getElementById('uptime').textContent=fmt(d.uptime_seconds);
+    var cl=document.getElementById('clients');
+    if(d.active_clients.length){
+      cl.innerHTML=d.active_clients.map(function(c){return '<div class="item">'+c+'</div>';}).join('');
+    }else{cl.innerHTML='<em>No active clients</em>';}
+    var bl=document.getElementById('blacklist');
+    if(d.ws_blacklist.length){
+      bl.innerHTML=d.ws_blacklist.join(', ');
+    }else{bl.innerHTML='<em>None</em>';}
+    document.getElementById('status').style.background='#66bb6a';
+  }catch(e){document.getElementById('status').style.background='#ef5350';}
+}
+setInterval(refresh,2000);refresh();
+</script>
+</body>
+</html>
+"""
+
+
+async def _handle_monitor_request(reader, writer):
+    try:
+        data = await asyncio.wait_for(reader.read(4096), timeout=5)
+        request_line = data.split(b'\r\n')[0].decode('utf-8', errors='replace')
+        parts = request_line.split()
+        path = parts[1] if len(parts) > 1 else '/'
+
+        if path == '/api/stats':
+            uptime = time.monotonic() - _start_time
+            pool_total = _stats.pool_hits + _stats.pool_misses
+            body = json.dumps({
+                'active_connections': len(_active_connections),
+                'active_clients': sorted(_active_connections),
+                'connections_total': _stats.connections_total,
+                'connections_ws': _stats.connections_ws,
+                'connections_tcp_fallback': _stats.connections_tcp_fallback,
+                'connections_http_rejected': _stats.connections_http_rejected,
+                'connections_passthrough': _stats.connections_passthrough,
+                'ws_errors': _stats.ws_errors,
+                'pool_hits': _stats.pool_hits,
+                'pool_misses': _stats.pool_misses,
+                'pool_hit_rate': round(_stats.pool_hits / pool_total * 100, 1) if pool_total else 0,
+                'bytes_up': _stats.bytes_up,
+                'bytes_down': _stats.bytes_down,
+                'bytes_up_human': _human_bytes(_stats.bytes_up),
+                'bytes_down_human': _human_bytes(_stats.bytes_down),
+                'uptime_seconds': round(uptime, 1),
+                'ws_blacklist': [f'DC{d}{"m" if m else ""}' for d, m in sorted(_ws_blacklist)],
+            })
+            resp = (f'HTTP/1.1 200 OK\r\n'
+                    f'Content-Type: application/json\r\n'
+                    f'Access-Control-Allow-Origin: *\r\n'
+                    f'Content-Length: {len(body)}\r\n'
+                    f'\r\n{body}')
+        elif path == '/' or path == '/index.html':
+            body = _MONITOR_HTML
+            resp = (f'HTTP/1.1 200 OK\r\n'
+                    f'Content-Type: text/html; charset=utf-8\r\n'
+                    f'Content-Length: {len(body.encode("utf-8"))}\r\n'
+                    f'\r\n{body}')
+        else:
+            resp = 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n'
+
+        writer.write(resp.encode('utf-8'))
+        await writer.drain()
+    except Exception:
+        pass
+    finally:
         try:
             writer.close()
         except BaseException:
@@ -1026,8 +1182,10 @@ _server_stop_event = None
 
 async def _run(port: int, dc_opt: Dict[int, Optional[str]],
                stop_event: Optional[asyncio.Event] = None,
-               host: str = '127.0.0.1'):
-    global _dc_opt, _server_instance, _server_stop_event
+               host: str = '127.0.0.1',
+               monitor_port: int = 0):
+    global _dc_opt, _server_instance, _server_stop_event, _start_time
+    _start_time = time.monotonic()
     _dc_opt = dc_opt
     _server_stop_event = stop_event
 
@@ -1062,6 +1220,12 @@ async def _run(port: int, dc_opt: Dict[int, Optional[str]],
             log.info("stats: %s | ws_bl: %s", _stats.summary(), bl)
 
     asyncio.create_task(log_stats())
+
+    monitor_server = None
+    if monitor_port:
+        monitor_server = await asyncio.start_server(
+            _handle_monitor_request, host, monitor_port)
+        log.info("  Monitor UI on  http://%s:%d", host, monitor_port)
 
     await _ws_pool.warmup(dc_opt)
 
@@ -1105,9 +1269,10 @@ def parse_dc_ip_list(dc_ip_list: List[str]) -> Dict[int, str]:
 
 def run_proxy(port: int, dc_opt: Dict[int, str],
               stop_event: Optional[asyncio.Event] = None,
-              host: str = '127.0.0.1'):
+              host: str = '127.0.0.1',
+              monitor_port: int = 0):
     """Run the proxy (blocking). Can be called from threads."""
-    asyncio.run(_run(port, dc_opt, stop_event, host))
+    asyncio.run(_run(port, dc_opt, stop_event, host, monitor_port=monitor_port))
 
 
 def main():
@@ -1121,6 +1286,8 @@ def main():
                     default=['2:149.154.167.220', '4:149.154.167.220'],
                     help='Target IP for a DC, e.g. --dc-ip 1:149.154.175.205'
                          ' --dc-ip 2:149.154.167.220')
+    ap.add_argument('--monitor-port', type=int, default=0,
+                    help='HTTP port for monitoring web UI (0 = disabled)')
     ap.add_argument('-v', '--verbose', action='store_true',
                     help='Debug logging')
     args = ap.parse_args()
@@ -1138,7 +1305,8 @@ def main():
     )
 
     try:
-        asyncio.run(_run(args.port, dc_opt, host=args.host))
+        asyncio.run(_run(args.port, dc_opt, host=args.host,
+                         monitor_port=args.monitor_port))
     except KeyboardInterrupt:
         log.info("Shutting down. Final stats: %s", _stats.summary())
 
